@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -8,8 +8,11 @@ import {
 	formatForgetCandidates,
 	formatForgottenRecords,
 	formatMemoryCapsule,
+	formatTimestamp,
 	formatWorkResume,
 	memoryRecordForSessionSummary,
+	parseMemoryDocument,
+	serializeMemoryDocument,
 	stripPrivateTags,
 } from "../src/core.mjs";
 import { buildRemembrallTree, RemembrallTreeBrowser, renderTreeLines, renderTreePlainText } from "../src/tree.mjs";
@@ -442,4 +445,139 @@ test("private tags are stripped before persistence", async () => {
 		assert.match(saved.record.title, /\[REDACTED\]/);
 		assert.doesNotMatch(saved.record.content, /sk-test/);
 	});
+});
+
+test("markdown serialization is stable and round-trips front matter plus body", () => {
+	const record = {
+		id: "mem_doc_1",
+		title: "Doc title",
+		type: "decision",
+		scope: "project",
+		topicKey: "decision/doc-title",
+		status: "active",
+		tags: ["docs", "tree"],
+		relations: ["mem_other"],
+		createdAt: "2026-04-27T22:43:56-03:00",
+		updatedAt: "2026-04-27T22:44:56-03:00",
+		revision: 2,
+		hash: "abc123",
+		branchPath: ["root", "branch"],
+		content: "# Heading\nBody paragraph.",
+	};
+
+	const first = serializeMemoryDocument(record);
+	const second = serializeMemoryDocument(parseMemoryDocument(first).record);
+	assert.equal(first, second);
+	assert.match(first, /created_at: "2026-04-27T22:43:56-03:00"/);
+	assert.match(first, /updated_at: "2026-04-27T22:44:56-03:00"/);
+	assert.match(first, /# Heading/);
+});
+
+test("saveMemory writes one markdown document with timezone-aware front matter", async () => {
+	await withStore(async (store) => {
+		const saved = await store.saveMemory({
+			title: "Markdown persisted note",
+			type: "decision",
+			content: "# Details\nStored on disk.",
+			scope: "project",
+			topicKey: "decision/markdown-persisted-note",
+		});
+
+		const docs = store.documentPaths();
+		assert.equal(docs.length, 1);
+		const text = await readFile(docs[0], "utf8");
+		assert.match(text, /^---/);
+		assert.match(text, /type: "decision"/);
+		assert.match(text, /scope: "project"/);
+		assert.match(text, /created_at: ".*[+-]\d\d:\d\d"/);
+		assert.match(text, /updated_at: ".*[+-]\d\d:\d\d"/);
+		assert.match(text, /# Details/);
+		assert.equal(saved.record.id, parseMemoryDocument(text).record.id);
+	});
+});
+
+test("recall scans headers first and only loads matched document bodies", async () => {
+	await withStore(async (store) => {
+		await store.saveMemory({
+			title: "Alpha architecture",
+			type: "architecture",
+			content: "Shared body text.",
+			scope: "project",
+		});
+		await store.saveMemory({
+			title: "Bravo preference",
+			type: "preference",
+			content: "Other body text.",
+			scope: "personal",
+		});
+
+		store.debugReads.headerReads = 0;
+		store.debugReads.bodyReads = 0;
+		const results = store.recall("alpha", { limit: 5 });
+		assert.equal(results.length, 1);
+		assert.equal(results[0].record.title, "Alpha architecture");
+		assert.equal(store.debugReads.headerReads, 2);
+		assert.equal(store.debugReads.bodyReads, 1);
+	});
+});
+
+test("legacy journal data backfills into markdown documents on init", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-remembrall-legacy-"));
+	try {
+		const timestamp = formatTimestamp(new Date("2026-04-27T03:00:00.000Z"));
+		const record = {
+			id: "mem_legacy_1",
+			version: 1,
+			title: "Legacy journal entry",
+			type: "decision",
+			scope: "project",
+			content: "Migrated from JSON journal.",
+			createdAt: timestamp,
+			updatedAt: timestamp,
+			revision: 1,
+			hash: "legacyhash",
+			branchPath: [],
+		};
+		await writeFile(join(dir, "memories.v1.jsonl"), `${JSON.stringify({ version: 1, event: "save", savedAt: timestamp, record })}\n`, "utf8");
+		const store = new MemoryStore({ dataDir: dir });
+		await store.init();
+		assert.equal(store.allRecords().length, 1);
+		const docs = store.documentPaths();
+		assert.equal(docs.length, 1);
+		const markdown = await readFile(docs[0], "utf8");
+		assert.match(markdown, /Legacy journal entry/);
+		assert.match(markdown, /Migrated from JSON journal/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("tree detail rendering shows structured metadata and markdown body sections", () => {
+	const browser = new RemembrallTreeBrowser(
+		() => buildRemembrallTree([
+			{
+				id: "mem_doc_view",
+				title: "Document view",
+				type: "decision",
+				scope: "project",
+				status: "active",
+				content: "# Summary\n## Decision\n- keep markdown details",
+				revision: 1,
+				createdAt: "2026-04-27T22:43:56-03:00",
+				updatedAt: "2026-04-27T22:43:56-03:00",
+			},
+		], []),
+		testTheme(),
+		() => {},
+	);
+	browser.render(120);
+	browser.handleInput("down");
+	browser.handleInput("down");
+	browser.handleInput("down");
+	browser.handleInput("enter");
+	const rendered = browser.render(120).join("\n");
+	assert.match(rendered, /Status: active/);
+	assert.match(rendered, /Body/);
+	assert.match(rendered, /Summary/);
+	assert.match(rendered, /Decision/);
 });

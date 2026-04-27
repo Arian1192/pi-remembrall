@@ -118,6 +118,28 @@ function padLines(lines, total) {
 	return result.slice(0, total);
 }
 
+function renderMarkdownDocumentLines(content, theme, width) {
+	const lines = [];
+	for (const rawLine of safeText(content).split("\n")) {
+		const line = rawLine.trimEnd();
+		if (!line.trim()) {
+			lines.push("");
+			continue;
+		}
+		const heading = line.match(/^(#{1,6})\s+(.*)$/);
+		if (heading) {
+			if (lines.length > 0 && lines[lines.length - 1] !== "") lines.push("");
+			const level = heading[1].length;
+			const title = heading[2].trim();
+			const prefix = level === 1 ? "  § " : level === 2 ? "  • " : "    - ";
+			for (const wrapped of wrapPlainText(`${prefix}${title}`, Math.max(1, width - 2))) lines.push(`  ${wrapped}`);
+			continue;
+		}
+		for (const wrapped of wrapPlainText(line, Math.max(1, width - 2))) lines.push(`  ${wrapped}`);
+	}
+	return lines;
+}
+
 function renderDetailPane(node, theme, width, bodyRows, detailsScroll = 0, focused = false) {
 	const headerLine = truncateToWidth(
 		(focused ? theme.fg("accent", theme.bold(" Details ")) : theme.fg("muted", theme.bold(" Details "))) +
@@ -154,15 +176,13 @@ function renderDetailPane(node, theme, width, bodyRows, detailsScroll = 0, focus
 		metaLines.push(`  Type: ${theme.fg("accent", record.type)}`);
 		metaLines.push(`  Scope: ${theme.fg("accent", record.scope)}`);
 		if (record.topicKey) metaLines.push(`  Topic: ${theme.fg("accent", record.topicKey)}`);
+		if (record.status) metaLines.push(`  Status: ${theme.fg(record.status === "forgotten" ? "warning" : "success", record.status)}`);
+		if (record.tags?.length) metaLines.push(`  Tags: ${theme.fg("muted", record.tags.join(", "))}`);
 		if (record.revision) metaLines.push(`  Revision: ${theme.fg("accent", String(record.revision))}`);
 		if (record.updatedAt) metaLines.push(`  Updated: ${theme.fg("dim", record.updatedAt)}`);
 		if (record.createdAt) metaLines.push(`  Created: ${theme.fg("dim", record.createdAt)}`);
-		contentLines.push(`  ${theme.fg("muted", "Content")}`);
-		for (const paragraph of safeText(record.content).split("\n")) {
-			for (const wrapped of wrapPlainText(paragraph, Math.max(1, width - 2))) {
-				contentLines.push(`  ${wrapped}`);
-			}
-		}
+		contentLines.push(`  ${theme.fg("muted", "Body")}`);
+		contentLines.push(...renderMarkdownDocumentLines(record.content, theme, width));
 	}
 
 	const staticLines = [headerLine, ...metaLines.map((line) => truncateToWidth(line, width))];
@@ -408,16 +428,14 @@ export function renderNodeDetails(node, theme, width = 120) {
 		lines.push(truncateToWidth(`  Type: ${theme.fg("accent", record.type)}`, width));
 		lines.push(truncateToWidth(`  Scope: ${theme.fg("accent", record.scope)}`, width));
 		if (record.topicKey) lines.push(truncateToWidth(`  Topic: ${theme.fg("accent", record.topicKey)}`, width));
+		if (record.status) lines.push(truncateToWidth(`  Status: ${theme.fg(record.status === "forgotten" ? "warning" : "success", record.status)}`, width));
+		if (record.tags?.length) lines.push(truncateToWidth(`  Tags: ${theme.fg("muted", record.tags.join(", "))}`, width));
 		if (record.revision) lines.push(truncateToWidth(`  Revision: ${theme.fg("accent", String(record.revision))}`, width));
 		if (record.updatedAt) lines.push(truncateToWidth(`  Updated: ${theme.fg("dim", record.updatedAt)}`, width));
 		if (record.createdAt) lines.push(truncateToWidth(`  Created: ${theme.fg("dim", record.createdAt)}`, width));
 		lines.push("");
-		lines.push(truncateToWidth(`  ${theme.fg("muted", "Content")}`, width));
-		for (const paragraph of safeText(record.content).split("\n")) {
-			for (const wrapped of wrapPlainText(paragraph, Math.max(1, width - 2))) {
-				lines.push(truncateToWidth(`  ${wrapped}`, width));
-			}
-		}
+		lines.push(truncateToWidth(`  ${theme.fg("muted", "Body")}`, width));
+		for (const line of renderMarkdownDocumentLines(record.content, theme, width)) lines.push(truncateToWidth(line, width));
 		return lines;
 	}
 
