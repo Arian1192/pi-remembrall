@@ -11,7 +11,7 @@ It saves high-signal memories such as decisions, architecture notes, bugfixes, d
 - `forget` tool for hiding saved memories from future recall and injection
 - `memory_summary` tool for explicit session-summary persistence
 - `/remembrall [query]` command for status, quick recall, and forget candidate lookup
-- `/remembrall-tree` command for browsing the memory hierarchy and forgetting an exact selected memory
+- `/remembrall-tree` command for browsing the memory hierarchy, collapsing/expanding sections, and forgetting an exact selected memory
 - transient memory capsule injection before agent turns
 - branch-aware ranking using the current Pi session branch
 - topic-key upserts for mutable topics
@@ -100,8 +100,11 @@ Browse the memory tree:
 /remembrall-tree
 ```
 
-In the interactive UI, the tree opens as a floating split panel with the tree on the left and details on the right.
-Inside the tree browser, select a record and press `d`, then confirm with `y` to forget it.
+In the interactive UI, the tree opens as a fixed-size floating split panel with the tree on the left and details on the right.
+`Tab` switches between the tree and details panes.
+In the tree pane, `Enter` toggles expandable sections, `Right` expands, and `Left`/`Backspace` collapses or moves to the parent.
+In the details pane, `j`/`k` scroll long content.
+Select a record and press `d`, then confirm with `y` to forget it.
 
 ## Forget semantics
 
