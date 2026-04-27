@@ -7,6 +7,8 @@ import {
 	MEMORY_TYPES,
 	MemoryStore,
 	branchPathFromEntries,
+	formatForgetCandidates,
+	formatForgottenRecords,
 	formatMemoryCapsule,
 	formatRecallResults,
 	memoryRecordForSessionSummary,
@@ -46,6 +48,15 @@ const SummaryParams = Type.Object({
 	title: Type.Optional(Type.String({ description: "Optional title for the summary memory." })),
 });
 
+const ForgetParams = Type.Object({
+	id: Type.Optional(Type.String({ description: "Exact memory id to forget." })),
+	query: Type.Optional(Type.String({ description: "Search query used to resolve candidate memories before forgetting." })),
+	type: Type.Optional(memoryTypeEnum),
+	scope: Type.Optional(memoryScopeEnum),
+	limit: Type.Optional(Type.Number({ description: "Maximum number of candidate memories to inspect." })),
+	reason: Type.Optional(Type.String({ description: "Optional reason describing why the memory is being forgotten." })),
+});
+
 function metadataFromContext(ctx: ExtensionContext) {
 	const branch = ctx.sessionManager.getBranch();
 	return {
@@ -55,17 +66,44 @@ function metadataFromContext(ctx: ExtensionContext) {
 	};
 }
 
-function memoryRecordsFromSession(ctx: ExtensionContext) {
+function memoryEventsFromSession(ctx: ExtensionContext) {
 	return ctx.sessionManager
 		.getEntries()
 		.filter((entry: any) => entry.type === "custom" && entry.customType === EXTENSION_NAME)
-		.map((entry: any) => entry.data?.record)
+		.map((entry: any) => entry.data)
+		.map((data: any) => {
+			if (data?.kind === "memory-record" && data.record?.id) {
+				return { event: "save", record: data.record };
+			}
+			if (data?.kind === "memory-forget" && Array.isArray(data.targetIds)) {
+				return {
+					event: "forget",
+					targetIds: data.targetIds,
+					reason: data.reason,
+					forgotAt: data.forgotAt,
+				};
+			}
+			return undefined;
+		})
 		.filter(Boolean);
+}
+
+function memoryRecordsFromEvents(events: any[]) {
+	return events.filter((event: any) => event?.event === "save" && event.record?.id).map((event: any) => event.record);
 }
 
 async function initializeFromSession(ctx: ExtensionContext) {
 	await store.init();
-	await store.importRecords(memoryRecordsFromSession(ctx));
+	const events = memoryEventsFromSession(ctx);
+	if (typeof store.importEvents === "function") {
+		await store.importEvents(events);
+		return;
+	}
+	if (typeof store.importRecords === "function") {
+		await store.importRecords(memoryRecordsFromEvents(events));
+		return;
+	}
+	throw new Error("MemoryStore must provide importEvents() or importRecords().");
 }
 
 async function saveMemoryThroughStore(pi: ExtensionAPI, ctx: ExtensionContext, input: Record<string, unknown>): Promise<any> {
@@ -76,6 +114,19 @@ async function saveMemoryThroughStore(pi: ExtensionAPI, ctx: ExtensionContext, i
 		updated: saved.updated,
 	});
 	return saved;
+}
+
+async function forgetMemoryThroughStore(pi: ExtensionAPI, ctx: ExtensionContext, input: Record<string, unknown>): Promise<any> {
+	const forgotten = await store.forgetMemory(input, metadataFromContext(ctx));
+	if (!forgotten.alreadyForgotten && forgotten.event) {
+		pi.appendEntry(EXTENSION_NAME, {
+			kind: "memory-forget",
+			targetIds: forgotten.targetIds,
+			reason: forgotten.event.reason,
+			forgotAt: forgotten.event.forgotAt,
+		});
+	}
+	return forgotten;
 }
 
 function stripPrivate(value: unknown) {
@@ -310,6 +361,59 @@ export default function (pi: ExtensionAPI) {
 	} as any);
 
 	pi.registerTool({
+		name: "forget",
+		label: "Forget",
+		description: "Hide a saved memory from future recall, capsules, and tree browsing. Prefer exact ids; query-based forgetting must resolve to exact candidates first.",
+		promptSnippet: "Hide saved memories that should no longer be used.",
+		promptGuidelines: [
+			"Prefer forgetting by exact memory id when available.",
+			"If a query returns multiple matches, present candidates and ask for an exact id instead of forgetting ambiguously.",
+		],
+		parameters: ForgetParams,
+		executionMode: "sequential",
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			await initializeFromSession(ctx);
+			if (params.id) {
+				const forgotten = await forgetMemoryThroughStore(pi, ctx, params);
+				const prefix = forgotten.alreadyForgotten ? "Memory already forgotten" : "Forgot memory";
+				return {
+					content: [{ type: "text", text: formatForgottenRecords(forgotten.records, { prefix }) }],
+					details: forgotten,
+				};
+			}
+			if (!params.query) {
+				return {
+					content: [{ type: "text", text: "Provide either an exact memory id or a query to resolve forget candidates." }],
+					details: { count: 0, results: [] },
+				};
+			}
+			const results = store.recall(params.query, {
+				type: params.type,
+				scope: params.scope,
+				limit: params.limit ?? 5,
+				branchPath: metadataFromContext(ctx).branchPath,
+			});
+			if (results.length === 0) {
+				return {
+					content: [{ type: "text", text: formatForgetCandidates(results, { query: params.query }) }],
+					details: { count: 0, results },
+				};
+			}
+			if (results.length === 1) {
+				const forgotten = await forgetMemoryThroughStore(pi, ctx, { id: results[0].record.id, reason: params.reason });
+				return {
+					content: [{ type: "text", text: `Forgot memory ${results[0].record.id}: ${results[0].record.title}` }],
+					details: { ...forgotten, resolvedFromQuery: params.query },
+				};
+			}
+			return {
+				content: [{ type: "text", text: formatForgetCandidates(results, { query: params.query }) }],
+				details: { count: results.length, results },
+			};
+		},
+	} as any);
+
+	pi.registerTool({
 		name: "memory_summary",
 		label: "Memory Summary",
 		description: "Persist an explicit or generated session summary to Pi Remembrall.",
@@ -326,10 +430,32 @@ export default function (pi: ExtensionAPI) {
 	} as any);
 
 	pi.registerCommand("remembrall", {
-		description: "Show Pi Remembrall memory status or recall memories for a query",
+		description: "Show Pi Remembrall memory status, recall memories, or manage forget candidates",
 		handler: async (args, ctx) => {
 			await initializeFromSession(ctx);
-			const query = args.trim() || lastPrompt;
+			const trimmed = args.trim();
+			if (trimmed.startsWith("forget")) {
+				const forgetArgs = trimmed.slice("forget".length).trim();
+				if (!forgetArgs) {
+					ctx.ui.notify("Usage: /remembrall forget <query> or /remembrall forget id:<memory-id>", "info");
+					return;
+				}
+				if (forgetArgs.startsWith("id:")) {
+					const id = forgetArgs.slice(3).trim();
+					if (!id) {
+						ctx.ui.notify("Provide a memory id after id: to forget an exact memory.", "info");
+						return;
+					}
+					const forgotten = await forgetMemoryThroughStore(pi, ctx, { id, reason: "command forget" });
+					const prefix = forgotten.alreadyForgotten ? "Memory already forgotten" : "Forgot memory";
+					ctx.ui.notify(formatForgottenRecords(forgotten.records, { prefix }), "info");
+					return;
+				}
+				const results = store.recall(forgetArgs, { branchPath: metadataFromContext(ctx).branchPath, limit: 5 });
+				ctx.ui.notify(formatForgetCandidates(results, { query: forgetArgs }), "info");
+				return;
+			}
+			const query = trimmed || lastPrompt;
 			if (!query) {
 				ctx.ui.notify(`Pi Remembrall has ${store.allRecords().length} memories.`, "info");
 				return;
@@ -349,9 +475,28 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			await ctx.ui.custom<void>((_tui, theme, _kb, done) => {
-				return new RemembrallTreeBrowser(getTree, theme, () => done(undefined));
-			});
+			await ctx.ui.custom(
+				(tui, theme, _kb, done) => {
+					return new RemembrallTreeBrowser(
+						getTree,
+						theme,
+						() => done(undefined),
+						async (record: any) => {
+							await forgetMemoryThroughStore(pi, ctx, { id: record.id, reason: "tree browser forget" });
+						},
+						() => tui.requestRender(),
+					);
+				},
+				{
+					overlay: true,
+					overlayOptions: {
+						width: 120,
+						maxHeight: 31,
+						anchor: "center",
+						margin: 1,
+					},
+				},
+			);
 		},
 	});
 }

@@ -41,12 +41,14 @@ export function stripPrivateTags(value) {
 
 export function normalizeTopicKey(value) {
 	const text = stripPrivateTags(value ?? "").toLowerCase();
-	return text
-		.replace(/[^a-z0-9/_ -]+/g, "")
-		.replace(/[ _]+/g, "-")
-		.replace(/\/{2,}/g, "/")
-		.replace(/-+/g, "-")
-		.replace(/^[-/]+|[-/]+$/g, "") || undefined;
+	return (
+		text
+			.replace(/[^a-z0-9/_ -]+/g, "")
+			.replace(/[ _]+/g, "-")
+			.replace(/\/{2,}/g, "/")
+			.replace(/-+/g, "-")
+			.replace(/^[-/]+|[-/]+$/g, "") || undefined
+	);
 }
 
 export function isMemoryType(value) {
@@ -216,12 +218,49 @@ function mutableTopicKeyFor(input) {
 	return `${input.scope}:${input.topicKey}`;
 }
 
+function normalizeForgetReason(value) {
+	const text = stripPrivateTags(value ?? "");
+	return text || undefined;
+}
+
+function toForgetTargetIds(input) {
+	if (Array.isArray(input?.targetIds)) return input.targetIds.filter(Boolean);
+	if (input?.id) return [input.id].filter(Boolean);
+	return [];
+}
+
+function applyEventToState(state, event) {
+	if (!event || typeof event !== "object") return false;
+	if (event.event === "save" && event.record?.id) {
+		const existing = state.records.get(event.record.id);
+		const incomingTime = String(event.record.updatedAt ?? event.record.createdAt ?? "");
+		const existingTime = String(existing?.updatedAt ?? existing?.createdAt ?? "");
+		if (!existing || incomingTime >= existingTime) {
+			state.records.set(event.record.id, event.record);
+			return true;
+		}
+		return false;
+	}
+	if (event.event === "forget") {
+		let changed = false;
+		for (const id of toForgetTargetIds(event)) {
+			if (!state.forgottenIds.has(id)) {
+				state.forgottenIds.add(id);
+				changed = true;
+			}
+		}
+		return changed;
+	}
+	return false;
+}
+
 export class MemoryStore {
 	constructor(options = {}) {
 		this.dataDir = options.dataDir || defaultDataDir();
 		this.journalPath = options.journalPath || join(this.dataDir, "memories.v1.jsonl");
 		this.cachePath = options.cachePath || join(this.dataDir, "cache.v1.json");
 		this.records = new Map();
+		this.forgottenIds = new Set();
 		this.mutationQueue = Promise.resolve();
 		this.initialized = false;
 	}
@@ -229,7 +268,7 @@ export class MemoryStore {
 	async init() {
 		await mkdir(this.dataDir, { recursive: true });
 		await this.loadCache();
-		if (this.records.size === 0 && existsSync(this.journalPath)) {
+		if (this.records.size === 0 && this.forgottenIds.size === 0 && existsSync(this.journalPath)) {
 			await this.rebuildFromJournal();
 		}
 		this.initialized = true;
@@ -241,21 +280,21 @@ export class MemoryStore {
 			const parsed = JSON.parse(raw);
 			if (parsed?.version !== CURRENT_STORE_VERSION || !Array.isArray(parsed.records)) return;
 			this.records = new Map(parsed.records.map((record) => [record.id, record]));
+			this.forgottenIds = new Set(Array.isArray(parsed.forgottenIds) ? parsed.forgottenIds.filter(Boolean) : []);
 		} catch {
 			this.records = new Map();
+			this.forgottenIds = new Set();
 		}
 	}
 
 	async rebuildFromJournal() {
 		this.records = new Map();
+		this.forgottenIds = new Set();
 		try {
 			const raw = await readFile(this.journalPath, "utf8");
 			for (const line of raw.split("\n")) {
 				if (!line.trim()) continue;
-				const event = JSON.parse(line);
-				if (event?.event === "save" && event.record?.id) {
-					this.records.set(event.record.id, event.record);
-				}
+				applyEventToState(this, JSON.parse(line));
 			}
 			await this.writeCache();
 		} catch {
@@ -268,6 +307,7 @@ export class MemoryStore {
 			version: CURRENT_STORE_VERSION,
 			updatedAt: nowIso(),
 			records: [...this.records.values()],
+			forgottenIds: [...this.forgottenIds.values()],
 		};
 		await mkdir(dirname(this.cachePath), { recursive: true });
 		await writeFile(this.cachePath, JSON.stringify(payload, null, 2), "utf8");
@@ -284,6 +324,22 @@ export class MemoryStore {
 		return run;
 	}
 
+	isForgotten(id) {
+		return this.forgottenIds.has(id);
+	}
+
+	getRecord(id, options = {}) {
+		const record = this.records.get(id);
+		if (!record) return undefined;
+		if (!options.includeForgotten && this.isForgotten(id)) return undefined;
+		return record;
+	}
+
+	allRecords(options = {}) {
+		const includeForgotten = Boolean(options.includeForgotten);
+		return [...this.records.values()].filter((record) => includeForgotten || !this.isForgotten(record.id));
+	}
+
 	async saveMemory(input, metadata = {}) {
 		if (!this.initialized) await this.init();
 		return this.withMutation(async () => {
@@ -291,7 +347,7 @@ export class MemoryStore {
 			const currentBranchPath = metadata.branchPath ?? [];
 			const mutableKey = mutableTopicKeyFor(clean);
 			const existing = mutableKey
-				? [...this.records.values()].find((record) => record.mutableKey === mutableKey)
+				? this.allRecords().find((record) => record.mutableKey === mutableKey)
 				: undefined;
 			const timestamp = nowIso();
 
@@ -310,7 +366,7 @@ export class MemoryStore {
 						lastSessionFile: metadata.sessionFile,
 						lastLeafId: metadata.leafId,
 						branchPath: currentBranchPath,
-					}
+				  }
 				: {
 						id: createId(),
 						version: CURRENT_STORE_VERSION,
@@ -328,12 +384,42 @@ export class MemoryStore {
 						lastSessionFile: metadata.sessionFile,
 						lastLeafId: metadata.leafId,
 						branchPath: currentBranchPath,
-					};
+				  };
 
 			this.records.set(record.id, record);
-			await this.appendJournal({ version: CURRENT_STORE_VERSION, event: "save", savedAt: timestamp, record });
+			const event = { version: CURRENT_STORE_VERSION, event: "save", savedAt: timestamp, record };
+			await this.appendJournal(event);
 			await this.writeCache();
-			return { record, updated: Boolean(existing), historical: isHistoricalType(record.type) };
+			return { record, updated: Boolean(existing), historical: isHistoricalType(record.type), event };
+		});
+	}
+
+	async forgetMemory(input, metadata = {}) {
+		if (!this.initialized) await this.init();
+		return this.withMutation(async () => {
+			const targetIds = [...new Set(toForgetTargetIds(input))];
+			if (targetIds.length === 0) throw new Error("id or targetIds is required");
+			const records = targetIds.map((id) => this.records.get(id)).filter(Boolean);
+			if (records.length === 0) throw new Error(`No memory found for id(s): ${targetIds.join(", ")}`);
+			const newTargetIds = targetIds.filter((id) => !this.forgottenIds.has(id));
+			if (newTargetIds.length === 0) {
+				return { records, targetIds, alreadyForgotten: true, event: undefined };
+			}
+			const timestamp = nowIso();
+			for (const id of newTargetIds) this.forgottenIds.add(id);
+			const event = {
+				version: CURRENT_STORE_VERSION,
+				event: "forget",
+				forgotAt: timestamp,
+				targetIds: newTargetIds,
+				reason: normalizeForgetReason(input?.reason),
+				sessionFile: metadata.sessionFile,
+				leafId: metadata.leafId,
+				branchPath: metadata.branchPath ?? [],
+			};
+			await this.appendJournal(event);
+			await this.writeCache();
+			return { records, targetIds: newTargetIds, alreadyForgotten: false, event };
 		});
 	}
 
@@ -345,13 +431,14 @@ export class MemoryStore {
 		const explicitScope = Boolean(scopeFilter);
 		const now = Date.now();
 
-		const results = [...this.records.values()]
+		const results = this.allRecords()
 			.filter((record) => !scopeFilter || record.scope === scopeFilter)
 			.filter((record) => !typeFilter || record.type === typeFilter)
 			.map((record) => {
 				const haystack = tokenize([record.title, record.type, record.scope, record.topicKey, record.content].filter(Boolean).join(" "));
 				const hayset = new Set(haystack);
-				const lexical = tokens.length === 0 ? 1 : tokens.reduce((score, token) => score + (hayset.has(token) ? 12 : haystack.some((h) => h.includes(token)) ? 4 : 0), 0);
+				const lexical =
+					tokens.length === 0 ? 1 : tokens.reduce((score, token) => score + (hayset.has(token) ? 12 : haystack.some((h) => h.includes(token)) ? 4 : 0), 0);
 				const branchOverlap = (record.branchPath ?? []).filter((id) => currentBranchPath.has(id)).length;
 				const branchBoost = record.scope === "branch-local" ? 30 + Math.min(branchOverlap * 4, 30) : Math.min(branchOverlap * 2, 15);
 				const scopeBoost = explicitScope ? 10 : record.scope === "project" ? 8 : record.scope === "personal" ? 6 : 0;
@@ -382,8 +469,14 @@ export class MemoryStore {
 		return changed;
 	}
 
-	allRecords() {
-		return [...this.records.values()];
+	async importEvents(events = []) {
+		if (!this.initialized) await this.init();
+		let changed = false;
+		for (const event of events) {
+			changed = applyEventToState(this, event) || changed;
+		}
+		if (changed) await this.writeCache();
+		return changed;
 	}
 }
 
@@ -396,6 +489,22 @@ export function formatRecallResults(results) {
 			return `${index + 1}. [${record.type}/${record.scope}] ${record.title} (id=${record.id}${topic}${revision}, score=${score.toFixed(1)})\n${record.content}`;
 		})
 		.join("\n\n");
+}
+
+export function formatForgetCandidates(results, options = {}) {
+	const queryText = stripPrivateTags(options.query ?? "");
+	if (!results.length) return queryText ? `No matching memories found for forget query: ${queryText}` : "No matching memories found to forget.";
+	const header = queryText
+		? `Multiple memories match forget query: ${queryText}`
+		: "Multiple memories match the forget request.";
+	const lines = results.map(({ record }, index) => `${index + 1}. [${record.type}/${record.scope}] ${record.title} (id=${record.id})`);
+	return `${header}\n${lines.join("\n")}\nRerun the forget action with an exact id to hide one memory.`;
+}
+
+export function formatForgottenRecords(records, options = {}) {
+	const prefix = options.prefix || "Forgot memory";
+	if (!records?.length) return `${prefix}: none`;
+	return `${prefix}:\n${records.map((record) => `${record.id}: ${record.title}`).join("\n")}`;
 }
 
 export function formatMemoryCapsule(results, options = {}) {

@@ -8,9 +8,10 @@ It saves high-signal memories such as decisions, architecture notes, bugfixes, d
 
 - `remember` tool for structured persistent memory saves plus YOLO work-resume checkpoints
 - `recall` tool for compact ranked memory search
+- `forget` tool for hiding saved memories from future recall and injection
 - `memory_summary` tool for explicit session-summary persistence
-- `/remembrall [query]` command for status or quick recall
-- `/remembrall-tree` command for browsing the memory hierarchy
+- `/remembrall [query]` command for status, quick recall, and forget candidate lookup
+- `/remembrall-tree` command for browsing the memory hierarchy and forgetting an exact selected memory
 - transient memory capsule injection before agent turns
 - branch-aware ranking using the current Pi session branch
 - topic-key upserts for mutable topics
@@ -79,10 +80,18 @@ Recall memories:
 What do you remember about the memory index design?
 ```
 
+Forget a memory by exact id, or resolve candidates first:
+
+```text
+Forget memory mem_abc123
+```
+
 Use the command directly:
 
 ```text
 /remembrall memory index
+/remembrall forget auth token
+/remembrall forget id:mem_abc123
 ```
 
 Browse the memory tree:
@@ -90,6 +99,22 @@ Browse the memory tree:
 ```text
 /remembrall-tree
 ```
+
+In the interactive UI, the tree opens as a floating split panel with the tree on the left and details on the right.
+Inside the tree browser, select a record and press `d`, then confirm with `y` to forget it.
+
+## Forget semantics
+
+Forgetting is implemented as an append-only tombstone, not a hard delete from session history.
+
+Effects:
+- forgotten memories no longer appear in recall results
+- forgotten memories are excluded from memory capsule injection
+- forgotten memories are hidden from the active tree browser
+
+Limitations:
+- older summaries or prior turns may still mention content that was forgotten later
+- command-based forgetting only applies after an exact id is provided
 
 ## Work resumes
 
