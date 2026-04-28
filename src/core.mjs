@@ -1,12 +1,23 @@
-import { mkdir, readFile, writeFile, appendFile, unlink } from "node:fs/promises";
-import { existsSync, readdirSync, readFileSync, openSync, readSync, closeSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { mkdir, readFile, writeFile, appendFile, unlink, rename, copyFile } from "node:fs/promises";
+import { existsSync, readdirSync, readFileSync, openSync, readSync, closeSync, statSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 
 export const EXTENSION_NAME = "pi-remembrall";
 export const CURRENT_STORE_VERSION = 1;
 export const DOCUMENT_SCHEMA_VERSION = 1;
+export const DEFAULT_CONFIG_FILENAME = "config.json";
+
+export const DEFAULT_REMEMBRALL_CONFIG = Object.freeze({
+	capsule: { maxItems: 4, maxChars: 1200 },
+	recall: { defaultLimit: 5, minScore: 1 },
+	scopes: { enabled: ["branch-local", "project", "personal"] },
+	types: { priorityOverrides: {} },
+	privacy: { redactSecrets: false },
+	prune: { sessionSummaryDays: 30 },
+	storage: { dir: defaultDataDir() },
+});
 
 export const MEMORY_TYPES = Object.freeze([
 	"architecture",
@@ -42,8 +53,14 @@ export const FRONT_MATTER_FIELDS = Object.freeze([
 	"status",
 	"tags",
 	"relations",
+	"source",
+	"relevant_files",
+	"pinned",
+	"repo_id",
+	"git_branch",
 	"created_at",
 	"updated_at",
+	"expires_at",
 	"revision",
 	"hash",
 	"branch_path",
@@ -54,6 +71,87 @@ export const FRONT_MATTER_FIELDS = Object.freeze([
 
 export function defaultDataDir() {
 	return process.env.PI_REMEMBRALL_DIR || join(homedir(), ".pi", "agent", "pi-remembrall");
+}
+
+export function defaultConfigPath(dataDir = defaultDataDir()) {
+	return join(dataDir, DEFAULT_CONFIG_FILENAME);
+}
+
+function deepMergeConfig(base, override) {
+	if (!override || typeof override !== "object" || Array.isArray(override)) return base;
+	const result = { ...base };
+	for (const [key, value] of Object.entries(override)) {
+		if (value && typeof value === "object" && !Array.isArray(value) && result[key] && typeof result[key] === "object" && !Array.isArray(result[key])) {
+			result[key] = deepMergeConfig(result[key], value);
+		} else {
+			result[key] = value;
+		}
+	}
+	return result;
+}
+
+function envBoolean(value) {
+	if (value == null) return undefined;
+	const lower = String(value).trim().toLowerCase();
+	if (["1", "true", "yes", "on"].includes(lower)) return true;
+	if (["0", "false", "no", "off"].includes(lower)) return false;
+	return undefined;
+}
+
+export function loadRemembrallConfig(options = {}) {
+	const dataDir = options.dataDir || defaultDataDir();
+	const configPath = options.configPath || defaultConfigPath(dataDir);
+	let config = deepMergeConfig(DEFAULT_REMEMBRALL_CONFIG, { storage: { dir: dataDir } });
+	try {
+		if (existsSync(configPath)) {
+			const parsed = JSON.parse(readFileSync(configPath, "utf8"));
+			config = deepMergeConfig(config, parsed);
+		}
+	} catch {
+		config = deepMergeConfig(DEFAULT_REMEMBRALL_CONFIG, { storage: { dir: dataDir } });
+	}
+	const env = options.env || process.env;
+	if (env.PI_REMEMBRALL_DIR) config.storage.dir = env.PI_REMEMBRALL_DIR;
+	if (env.PI_REMEMBRALL_CAPSULE_MAX_ITEMS) config.capsule.maxItems = Number(env.PI_REMEMBRALL_CAPSULE_MAX_ITEMS);
+	if (env.PI_REMEMBRALL_CAPSULE_MAX_CHARS) config.capsule.maxChars = Number(env.PI_REMEMBRALL_CAPSULE_MAX_CHARS);
+	if (env.PI_REMEMBRALL_RECALL_DEFAULT_LIMIT) config.recall.defaultLimit = Number(env.PI_REMEMBRALL_RECALL_DEFAULT_LIMIT);
+	if (env.PI_REMEMBRALL_RECALL_MIN_SCORE) config.recall.minScore = Number(env.PI_REMEMBRALL_RECALL_MIN_SCORE);
+	if (env.PI_REMEMBRALL_SCOPES_ENABLED) config.scopes.enabled = String(env.PI_REMEMBRALL_SCOPES_ENABLED).split(",").map((scope) => scope.trim()).filter(Boolean);
+	const redactSecrets = envBoolean(env.PI_REMEMBRALL_REDACT_SECRETS);
+	if (redactSecrets !== undefined) config.privacy.redactSecrets = redactSecrets;
+	return config;
+}
+
+export function isScopeEnabledByConfig(scope, config = DEFAULT_REMEMBRALL_CONFIG) {
+	const enabled = Array.isArray(config?.scopes?.enabled) ? config.scopes.enabled : MEMORY_SCOPES;
+	return enabled.includes(scope);
+}
+
+export function scopeFilterFromConfig(config = DEFAULT_REMEMBRALL_CONFIG) {
+	return new Set(Array.isArray(config?.scopes?.enabled) ? config.scopes.enabled : MEMORY_SCOPES);
+}
+
+function removeAccents(value) {
+	return String(value ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+}
+
+const STOPWORDS = new Set([
+	"the", "and", "for", "that", "with", "from", "this", "only", "about", "what", "when", "where",
+	"que", "con", "para", "del", "las", "los", "una", "uno", "por", "sobre", "solo", "sola", "solo", "como", "porque", "donde",
+]);
+
+const SECRET_PATTERNS = [
+	/gh[pousr]_[A-Za-z0-9_]{20,}/g,
+	/AKIA[0-9A-Z]{16}/g,
+	/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9._-]{10,}\.[A-Za-z0-9._-]{10,}/g,
+	/-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+PRIVATE KEY-----/g,
+	/\bsk-[A-Za-z0-9_-]{16,}\b/g,
+];
+
+export function redactSecrets(value, enabled = false) {
+	const base = String(value ?? "");
+	if (!enabled) return base;
+	return SECRET_PATTERNS.reduce((text, pattern) => text.replace(pattern, "[REDACTED_SECRET]"), base);
 }
 
 export function stripPrivateTags(value) {
@@ -88,12 +186,16 @@ export function isHistoricalType(type) {
 	return HISTORICAL_TYPES.includes(type);
 }
 
-export function validateMemoryInput(input) {
+export function validateMemoryInput(input, options = {}) {
 	const errors = [];
 	const type = input?.type;
 	const scope = input?.scope ?? "project";
-	const title = stripPrivateTags(input?.title);
-	const content = stripPrivateTags(input?.content);
+	const redact = Boolean(options.redactSecrets);
+	const title = stripPrivateTags(redactSecrets(input?.title, redact));
+	const content = stripPrivateTags(redactSecrets(input?.content, redact));
+	const tags = Array.isArray(input?.tags) ? input.tags.map((tag) => stripPrivateTags(tag)).filter(Boolean) : [];
+	const relations = Array.isArray(input?.relations) ? input.relations.map((id) => String(id).trim()).filter(Boolean) : [];
+	const relevantFiles = Array.isArray(input?.relevantFiles) ? input.relevantFiles.map((file) => stripPrivateTags(file)).filter(Boolean) : [];
 
 	if (!title) errors.push("title is required");
 	if (!content) errors.push("content is required");
@@ -112,15 +214,22 @@ export function validateMemoryInput(input) {
 		content,
 		scope,
 		topicKey: normalizeTopicKey(input?.topicKey),
+		tags,
+		relations,
+		source: stripPrivateTags(input?.source),
+		relevantFiles,
+		pinned: Boolean(input?.pinned),
+		expiresAt: input?.expiresAt ? String(input.expiresAt) : undefined,
 	};
 }
 
 export function tokenize(value) {
-	return stripPrivateTags(value)
+	return removeAccents(stripPrivateTags(value))
 		.toLowerCase()
 		.split(/[^a-z0-9_/-]+/g)
 		.map((token) => token.trim())
-		.filter((token) => token.length >= 2);
+		.filter((token) => token.length >= 2)
+		.filter((token) => !STOPWORDS.has(token));
 }
 
 function hashMemory(record) {
@@ -209,6 +318,48 @@ export function extractFileReferences(text) {
 		matches.add(match[1].replace(/^@/, ""));
 	}
 	return [...matches].slice(0, 12);
+}
+
+export function detectRepoContext(cwd = process.cwd()) {
+	let current = resolve(cwd);
+	while (current && current !== dirname(current)) {
+		const gitDir = join(current, ".git");
+		if (existsSync(gitDir)) {
+			let gitBranch;
+			try {
+				const head = readFileSync(join(gitDir, "HEAD"), "utf8").trim();
+				const match = head.match(/^ref:\s+refs\/heads\/(.+)$/);
+				gitBranch = match ? match[1] : undefined;
+			} catch {}
+			return { repoId: basename(current), repoRoot: current, gitBranch };
+		}
+		current = dirname(current);
+	}
+	return { repoId: undefined, repoRoot: undefined, gitBranch: undefined };
+}
+
+export function parseRecallQuery(query, options = {}) {
+	const text = removeAccents(stripPrivateTags(query)).toLowerCase();
+	const tags = [];
+	for (const match of text.matchAll(/(?:^|\s)#([a-z0-9_-]+)/g)) tags.push(match[1]);
+	let scope = options.scope;
+	if (!scope) {
+		if (/\bpersonal(?:es)?\b|\bpreferencias personales\b/.test(text)) scope = "personal";
+		else if (/\bproject\b|\bproyecto\b/.test(text)) scope = "project";
+		else if (/\bbranch\b|\brama\b/.test(text)) scope = "branch-local";
+	}
+	let type = options.type;
+	if (!type) {
+		if (/\b(?:solo|only)\s+decision(?:es)?\b|\bproject decisions?\b|\bdecisiones del proyecto\b/.test(text)) type = "decision";
+		else if (/\bpreferencias personales\b|\bpersonal preferences?\b/.test(text)) type = "preference";
+		else if (/\bresumen(?:es)? de rama\b|\bbranch summaries?\b/.test(text)) type = "session_summary";
+	}
+	const cleanedQuery = String(query ?? "")
+		.replace(/(^|\s)#[A-Za-z0-9_-]+/g, " ")
+		.replace(/\b(?:solo|only|personal(?:es)?|project|proyecto|rama|branch|decision(?:es)?|preferencia(?:s)?|preference(?:s)?|summary|resumen(?:es)?)\b/gi, " ")
+		.replace(/\s+/g, " ")
+		.trim();
+	return { query: cleanedQuery, scope, type, tags };
 }
 
 export function formatWorkResume(entries = [], options = {}) {
@@ -364,7 +515,9 @@ function normalizeRecord(record) {
 		status: record.status ?? "active",
 		tags: Array.isArray(record.tags) ? record.tags.filter(Boolean) : [],
 		relations: Array.isArray(record.relations) ? record.relations.filter(Boolean) : [],
+		relevantFiles: Array.isArray(record.relevantFiles) ? record.relevantFiles.filter(Boolean) : [],
 		branchPath: Array.isArray(record.branchPath) ? record.branchPath.filter(Boolean) : [],
+		pinned: Boolean(record.pinned),
 	};
 }
 
@@ -379,8 +532,14 @@ function recordToFrontMatter(record, forgottenIds = new Set()) {
 		status: documentStatusFor(record, forgottenIds),
 		tags: Array.isArray(record.tags) ? record.tags : [],
 		relations: Array.isArray(record.relations) ? record.relations : [],
+		source: record.source,
+		relevant_files: Array.isArray(record.relevantFiles) ? record.relevantFiles : [],
+		pinned: Boolean(record.pinned),
+		repo_id: record.repoId,
+		git_branch: record.gitBranch,
 		created_at: record.createdAt,
 		updated_at: record.updatedAt,
+		expires_at: record.expiresAt,
 		revision: record.revision ?? 1,
 		hash: record.hash,
 		branch_path: Array.isArray(record.branchPath) ? record.branchPath : [],
@@ -413,8 +572,14 @@ export function parseMemoryDocument(source, options = {}) {
 		status: frontMatter.status ?? "active",
 		tags: Array.isArray(frontMatter.tags) ? frontMatter.tags : [],
 		relations: Array.isArray(frontMatter.relations) ? frontMatter.relations : [],
+		source: frontMatter.source,
+		relevantFiles: Array.isArray(frontMatter.relevant_files) ? frontMatter.relevant_files : [],
+		pinned: Boolean(frontMatter.pinned),
+		repoId: frontMatter.repo_id,
+		gitBranch: frontMatter.git_branch,
 		createdAt: frontMatter.created_at,
 		updatedAt: frontMatter.updated_at,
+		expiresAt: frontMatter.expires_at,
 		revision: Number(frontMatter.revision ?? 1),
 		hash: frontMatter.hash,
 		branchPath: Array.isArray(frontMatter.branch_path) ? frontMatter.branch_path : [],
@@ -478,6 +643,13 @@ function loadDocumentBodySync(path) {
 	return parseMemoryDocument(readFileSync(path, "utf8"), { path }).record;
 }
 
+async function atomicWriteFile(path, content) {
+	const tempPath = `${path}.tmp-${randomUUID().slice(0, 8)}`;
+	await mkdir(dirname(path), { recursive: true });
+	await writeFile(tempPath, content, "utf8");
+	await rename(tempPath, path);
+}
+
 function baseLexicalScore(tokens, header) {
 	const haystack = tokenize([
 		header.title,
@@ -504,15 +676,42 @@ function enrichScore(record, lexical, options = {}) {
 	const branchOverlap = (record.branchPath ?? []).filter((id) => currentBranchPath.has(id)).length;
 	const branchBoost = record.scope === "branch-local" ? 30 + Math.min(branchOverlap * 4, 30) : Math.min(branchOverlap * 2, 15);
 	const scopeBoost = explicitScope ? 10 : record.scope === "project" ? 8 : record.scope === "personal" ? 6 : 0;
-	const typeBoost = TYPE_PRIORITY[record.type] ?? 0;
+	const overrideBoost = Number(options.config?.types?.priorityOverrides?.[record.type] ?? 0);
+	const typeBoost = overrideBoost || (TYPE_PRIORITY[record.type] ?? 0);
+	const pinnedBoost = record.pinned ? 15 : 0;
+	const repoBoost = options.repoId && record.repoId && options.repoId === record.repoId ? 20 : 0;
+	const gitBranchBoost = options.gitBranch && record.gitBranch && options.gitBranch === record.gitBranch ? 10 : 0;
 	const ageMs = Math.max(0, now - Date.parse(record.updatedAt ?? record.createdAt ?? new Date(0).toISOString()));
 	const recency = Math.max(0, 20 - ageMs / 86_400_000);
-	return lexical + branchBoost + scopeBoost + typeBoost + recency;
+	return lexical + branchBoost + scopeBoost + typeBoost + pinnedBoost + repoBoost + gitBranchBoost + recency;
+}
+
+function similarityScore(a, b) {
+	const left = new Set(tokenize(a));
+	const right = new Set(tokenize(b));
+	if (left.size === 0 || right.size === 0) return 0;
+	const intersection = [...left].filter((token) => right.has(token)).length;
+	const union = new Set([...left, ...right]).size;
+	return union === 0 ? 0 : intersection / union;
+}
+
+function buildExplainSignals(record, lexical, score, options = {}) {
+	const signals = [];
+	if (record.pinned) signals.push("pinned");
+	if (options.repoId && record.repoId === options.repoId) signals.push("repo-match");
+	if (options.gitBranch && record.gitBranch === options.gitBranch) signals.push("git-branch-match");
+	if (record.scope === "branch-local") signals.push("branch-local");
+	if (lexical > 0) signals.push(`lexical:${lexical}`);
+	return { score, lexical, signals };
 }
 
 export class MemoryStore {
 	constructor(options = {}) {
+		this.explicitDataDir = Boolean(options.dataDir);
 		this.dataDir = options.dataDir || defaultDataDir();
+		this.configPath = options.configPath || defaultConfigPath(this.dataDir);
+		this.configOverrides = options.config;
+		this.config = options.config || deepMergeConfig(DEFAULT_REMEMBRALL_CONFIG, { storage: { dir: this.dataDir } });
 		this.journalPath = options.journalPath || join(this.dataDir, "memories.v1.jsonl");
 		this.cachePath = options.cachePath || join(this.dataDir, "cache.v1.json");
 		this.documentsDir = options.documentsDir || join(this.dataDir, "db");
@@ -523,7 +722,25 @@ export class MemoryStore {
 		this.debugReads = { headerReads: 0, bodyReads: 0 };
 	}
 
+	reconfigurePaths(dataDir) {
+		this.dataDir = dataDir;
+		this.journalPath = join(this.dataDir, "memories.v1.jsonl");
+		this.cachePath = join(this.dataDir, "cache.v1.json");
+		this.documentsDir = join(this.dataDir, "db");
+		this.configPath = defaultConfigPath(this.dataDir);
+	}
+
+	isScopeEnabled(scope) {
+		return isScopeEnabledByConfig(scope, this.config);
+	}
+
 	async init() {
+		let loadedConfig = loadRemembrallConfig({ dataDir: this.dataDir, configPath: this.configPath });
+		if (this.configOverrides) loadedConfig = deepMergeConfig(loadedConfig, this.configOverrides);
+		if (!this.explicitDataDir && loadedConfig?.storage?.dir && loadedConfig.storage.dir !== this.dataDir) {
+			this.reconfigurePaths(loadedConfig.storage.dir);
+		}
+		this.config = loadedConfig;
 		await mkdir(this.dataDir, { recursive: true });
 		await mkdir(this.documentsDir, { recursive: true });
 		await this.loadCache();
@@ -585,8 +802,7 @@ export class MemoryStore {
 			records: [...this.records.values()].map((record) => ({ ...record, status: documentStatusFor(record, this.forgottenIds) })),
 			forgottenIds: [...this.forgottenIds.values()],
 		};
-		await mkdir(dirname(this.cachePath), { recursive: true });
-		await writeFile(this.cachePath, JSON.stringify(payload, null, 2), "utf8");
+		await atomicWriteFile(this.cachePath, JSON.stringify(payload, null, 2));
 	}
 
 	async appendJournal(event) {
@@ -608,6 +824,7 @@ export class MemoryStore {
 		const record = this.records.get(id);
 		if (!record) return undefined;
 		if (!options.includeForgotten && this.isForgotten(id)) return undefined;
+		if (!options.includeDisabledScopes && !this.isScopeEnabled(record.scope)) return undefined;
 		return { ...record, status: documentStatusFor(record, this.forgottenIds) };
 	}
 
@@ -615,6 +832,7 @@ export class MemoryStore {
 		const includeForgotten = Boolean(options.includeForgotten);
 		return [...this.records.values()]
 			.filter((record) => includeForgotten || !this.isForgotten(record.id))
+			.filter((record) => options.includeDisabledScopes || this.isScopeEnabled(record.scope))
 			.map((record) => ({ ...record, status: documentStatusFor(record, this.forgottenIds) }));
 	}
 
@@ -644,8 +862,14 @@ export class MemoryStore {
 			status: frontMatter.status ?? "active",
 			tags: Array.isArray(frontMatter.tags) ? frontMatter.tags : [],
 			relations: Array.isArray(frontMatter.relations) ? frontMatter.relations : [],
+			source: frontMatter.source,
+			relevantFiles: Array.isArray(frontMatter.relevant_files) ? frontMatter.relevant_files : [],
+			pinned: Boolean(frontMatter.pinned),
+			repoId: frontMatter.repo_id,
+			gitBranch: frontMatter.git_branch,
 			createdAt: frontMatter.created_at,
 			updatedAt: frontMatter.updated_at,
+			expiresAt: frontMatter.expires_at,
 			revision: Number(frontMatter.revision ?? 1),
 			hash: frontMatter.hash,
 			branchPath: Array.isArray(frontMatter.branch_path) ? frontMatter.branch_path : [],
@@ -666,8 +890,7 @@ export class MemoryStore {
 		const normalized = normalizeRecord(record);
 		const nextPath = options.path || documentPathForRecord(normalized, this.dataDir);
 		const oldPath = options.oldPath && options.oldPath !== nextPath ? options.oldPath : undefined;
-		await mkdir(dirname(nextPath), { recursive: true });
-		await writeFile(nextPath, serializeMemoryDocument({ ...normalized, docPath: nextPath }, { forgottenIds: this.forgottenIds }), "utf8");
+		await atomicWriteFile(nextPath, serializeMemoryDocument({ ...normalized, docPath: nextPath }, { forgottenIds: this.forgottenIds }));
 		if (oldPath) {
 			try {
 				await unlink(oldPath);
@@ -695,16 +918,170 @@ export class MemoryStore {
 		return this.documentPaths().length;
 	}
 
+	findPotentialDuplicates(input, options = {}) {
+		const clean = validateMemoryInput(input, { redactSecrets: this.config?.privacy?.redactSecrets });
+		const haystack = `${clean.title} ${clean.content}`;
+		return this.allRecords({ includeDisabledScopes: true })
+			.filter((record) => !options.excludeId || record.id !== options.excludeId)
+			.map((record) => {
+				const exactHash = record.hash && record.hash === hashMemory(clean);
+				const similarity = similarityScore(haystack, `${record.title} ${record.content}`);
+				return { record, exactHash, similarity };
+			})
+			.filter((result) => result.exactHash || result.similarity >= 0.25)
+			.sort((a, b) => (Number(b.exactHash) - Number(a.exactHash)) || b.similarity - a.similarity)
+			.slice(0, 3);
+	}
+
+	statusSummary() {
+		const countsByScope = Object.fromEntries(MEMORY_SCOPES.map((scope) => [scope, 0]));
+		const countsByType = Object.fromEntries(MEMORY_TYPES.map((type) => [type, 0]));
+		for (const record of this.allRecords()) {
+			countsByScope[record.scope] = (countsByScope[record.scope] ?? 0) + 1;
+			countsByType[record.type] = (countsByType[record.type] ?? 0) + 1;
+		}
+		return {
+			total: this.allRecords().length,
+			forgotten: this.allRecords({ includeForgotten: true, includeDisabledScopes: true }).length - this.allRecords({ includeDisabledScopes: true }).length,
+			countsByScope,
+			countsByType,
+			storage: {
+				dataDir: this.dataDir,
+				documents: this.documentPaths().length,
+				cacheExists: existsSync(this.cachePath),
+				journalExists: existsSync(this.journalPath),
+				documentsDirExists: existsSync(this.documentsDir),
+			},
+			config: this.config,
+		};
+	}
+
+	doctor() {
+		const status = this.statusSummary();
+		const issues = [];
+		if (!status.storage.documentsDirExists) issues.push("documents directory missing");
+		if (!status.storage.cacheExists) issues.push("cache file missing");
+		if (!status.storage.journalExists) issues.push("journal file missing");
+		return { ...status, issues };
+	}
+
+	exportSnapshot() {
+		return {
+			version: CURRENT_STORE_VERSION,
+			exportedAt: formatTimestamp(),
+			records: this.allRecords({ includeForgotten: true, includeDisabledScopes: true }),
+			forgottenIds: [...this.forgottenIds],
+			config: this.config,
+		};
+	}
+
+	async importSnapshot(snapshot) {
+		const parsed = typeof snapshot === "string" ? JSON.parse(snapshot) : snapshot;
+		await this.importRecords(parsed?.records ?? []);
+		for (const id of parsed?.forgottenIds ?? []) this.forgottenIds.add(id);
+		for (const id of this.forgottenIds) {
+			const record = this.records.get(id);
+			if (record) this.records.set(id, { ...record, status: "forgotten" });
+		}
+		await this.ensureMarkdownBackfill();
+		await this.writeCache();
+		return { records: this.allRecords({ includeForgotten: true, includeDisabledScopes: true }).length };
+	}
+
+	async pinMemory(input) {
+		return this.reviseMemory({ id: input.id, pinned: input.pinned !== false });
+	}
+
+	explainRecall(input = {}) {
+		const parsed = parseRecallQuery(input.query ?? "", input);
+		const results = this.recall(parsed.query || input.query || "", { ...input, scope: input.scope ?? parsed.scope, type: input.type ?? parsed.type, tags: input.tags ?? parsed.tags, explain: true });
+		return results.map((result) => ({ record: result.record, ...buildExplainSignals(result.record, result.lexical, result.score, input) }));
+	}
+
+	async reviseMemory(input, metadata = {}) {
+		if (!this.initialized) await this.init();
+		return this.withMutation(async () => {
+			const existing = this.records.get(input?.id);
+			if (!existing) throw new Error(`No memory found for id: ${input?.id}`);
+			const merged = {
+				...existing,
+				title: input.title ?? existing.title,
+				type: input.type ?? existing.type,
+				content: input.content ?? existing.content,
+				scope: input.scope ?? existing.scope,
+				topicKey: input.topicKey ?? existing.topicKey,
+				tags: input.tags ?? existing.tags,
+				relations: input.relations ?? existing.relations,
+				source: input.source ?? existing.source,
+				relevantFiles: input.relevantFiles ?? existing.relevantFiles,
+				pinned: input.pinned ?? existing.pinned,
+				expiresAt: input.expiresAt ?? existing.expiresAt,
+			};
+			const clean = validateMemoryInput(merged, { redactSecrets: this.config?.privacy?.redactSecrets });
+			if (!this.isScopeEnabled(clean.scope)) throw new Error(`Scope disabled by config: ${clean.scope}`);
+			const repoContext = detectRepoContext();
+			const timestamp = formatTimestamp();
+			const record = normalizeRecord({
+				...existing,
+				...clean,
+				updatedAt: timestamp,
+				revision: (existing.revision ?? 1) + 1,
+				hash: hashMemory(clean),
+				lastSessionFile: metadata.sessionFile ?? existing.lastSessionFile,
+				lastLeafId: metadata.leafId ?? existing.lastLeafId,
+				branchPath: metadata.branchPath ?? existing.branchPath,
+				repoId: metadata.repoId ?? existing.repoId ?? repoContext.repoId,
+				gitBranch: metadata.gitBranch ?? existing.gitBranch ?? repoContext.gitBranch,
+				status: "active",
+			});
+			record.docPath = documentPathForRecord(record, this.dataDir);
+			this.records.set(record.id, record);
+			await this.writeMarkdownDocument(record, { path: record.docPath, oldPath: existing.docPath });
+			const event = { version: CURRENT_STORE_VERSION, event: "save", savedAt: timestamp, record };
+			await this.appendJournal(event);
+			await this.writeCache();
+			return { record, updated: true, event };
+		});
+	}
+
+	async pruneMemories(options = {}) {
+		if (!this.initialized) await this.init();
+		const thresholdDays = Number(options.sessionSummaryDays ?? this.config?.prune?.sessionSummaryDays ?? 30);
+		const cutoff = Date.now() - thresholdDays * 86_400_000;
+		const prunable = this.allRecords({ includeDisabledScopes: true })
+			.filter((record) => record.type === "session_summary")
+			.filter((record) => Date.parse(record.updatedAt ?? record.createdAt ?? new Date(0).toISOString()) < cutoff);
+		if (!prunable.length) return { pruned: [] };
+		const forgotten = await this.forgetMemory({ targetIds: prunable.map((record) => record.id), reason: "prune stale session summaries" }, options.metadata || {});
+		return { pruned: forgotten.records };
+	}
+
+	async compactJournal() {
+		if (!this.initialized) await this.init();
+		const events = [];
+		for (const record of this.allRecords({ includeForgotten: true, includeDisabledScopes: true })) {
+			events.push({ version: CURRENT_STORE_VERSION, event: "save", savedAt: record.updatedAt ?? record.createdAt ?? formatTimestamp(), record });
+		}
+		if (this.forgottenIds.size > 0) {
+			events.push({ version: CURRENT_STORE_VERSION, event: "forget", forgotAt: formatTimestamp(), targetIds: [...this.forgottenIds], reason: "journal compaction" });
+		}
+		await atomicWriteFile(this.journalPath, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`);
+		return { events: events.length };
+	}
+
 	async saveMemory(input, metadata = {}) {
 		if (!this.initialized) await this.init();
 		return this.withMutation(async () => {
-			const clean = validateMemoryInput(input);
+			const clean = validateMemoryInput(input, { redactSecrets: this.config?.privacy?.redactSecrets });
+			if (!this.isScopeEnabled(clean.scope)) throw new Error(`Scope disabled by config: ${clean.scope}`);
 			const currentBranchPath = metadata.branchPath ?? [];
 			const mutableKey = mutableTopicKeyFor(clean);
 			const existing = mutableKey
-				? this.allRecords().find((record) => record.mutableKey === mutableKey)
+				? this.allRecords({ includeDisabledScopes: true }).find((record) => record.mutableKey === mutableKey)
 				: undefined;
+			const repoContext = detectRepoContext();
 			const timestamp = formatTimestamp();
+			const duplicates = this.findPotentialDuplicates(clean, { excludeId: existing?.id });
 			const record = normalizeRecord(
 				existing
 					? {
@@ -714,6 +1091,12 @@ export class MemoryStore {
 						content: clean.content,
 						scope: clean.scope,
 						topicKey: clean.topicKey,
+						tags: clean.tags,
+						relations: clean.relations,
+						source: clean.source ?? existing.source,
+						relevantFiles: clean.relevantFiles,
+						pinned: clean.pinned ?? existing.pinned,
+						expiresAt: clean.expiresAt,
 						mutableKey,
 						updatedAt: timestamp,
 						revision: (existing.revision ?? 1) + 1,
@@ -721,6 +1104,8 @@ export class MemoryStore {
 						lastSessionFile: metadata.sessionFile,
 						lastLeafId: metadata.leafId,
 						branchPath: currentBranchPath,
+						repoId: metadata.repoId ?? existing.repoId ?? repoContext.repoId,
+						gitBranch: metadata.gitBranch ?? existing.gitBranch ?? repoContext.gitBranch,
 						status: "active",
 					}
 					: {
@@ -731,6 +1116,12 @@ export class MemoryStore {
 						content: clean.content,
 						scope: clean.scope,
 						topicKey: clean.topicKey,
+						tags: clean.tags,
+						relations: clean.relations,
+						source: clean.source ?? metadata.source,
+						relevantFiles: clean.relevantFiles,
+						pinned: clean.pinned,
+						expiresAt: clean.expiresAt,
 						mutableKey,
 						createdAt: timestamp,
 						updatedAt: timestamp,
@@ -740,8 +1131,8 @@ export class MemoryStore {
 						lastSessionFile: metadata.sessionFile,
 						lastLeafId: metadata.leafId,
 						branchPath: currentBranchPath,
-						tags: [],
-						relations: [],
+						repoId: metadata.repoId ?? repoContext.repoId,
+						gitBranch: metadata.gitBranch ?? repoContext.gitBranch,
 						status: "active",
 					}
 			);
@@ -752,7 +1143,7 @@ export class MemoryStore {
 			const event = { version: CURRENT_STORE_VERSION, event: "save", savedAt: timestamp, record };
 			await this.appendJournal(event);
 			await this.writeCache();
-			return { record, updated: Boolean(existing), historical: isHistoricalType(record.type), event };
+			return { record, updated: Boolean(existing), historical: isHistoricalType(record.type), event, duplicates };
 		});
 	}
 
@@ -794,18 +1185,24 @@ export class MemoryStore {
 	}
 
 	recall(query, options = {}) {
-		const tokens = tokenize(query);
-		const scopeFilter = options.scope;
-		const typeFilter = options.type;
-		const limit = options.limit ?? 5;
+		const parsed = options.skipQueryParsing ? { query, scope: options.scope, type: options.type, tags: options.tags ?? [] } : parseRecallQuery(query, options);
+		const effectiveQuery = parsed.query || query;
+		const tokens = tokenize(effectiveQuery);
+		const scopeFilter = options.scope ?? parsed.scope;
+		const typeFilter = options.type ?? parsed.type;
+		const tagFilters = (options.tags ?? parsed.tags ?? []).filter(Boolean);
+		const limit = options.limit ?? this.config?.recall?.defaultLimit ?? 5;
+		const scoreOptions = { ...options, scope: scopeFilter, type: typeFilter, config: this.config };
 		const paths = this.documentPaths({ scope: scopeFilter, type: typeFilter });
 		if (paths.length === 0) {
 			return this.allRecords()
 				.filter((record) => !scopeFilter || record.scope === scopeFilter)
 				.filter((record) => !typeFilter || record.type === typeFilter)
+				.filter((record) => tagFilters.length === 0 || tagFilters.every((tag) => record.tags?.includes(tag)))
+				.filter((record) => !record.expiresAt || Date.parse(record.expiresAt) >= Date.now())
 				.map((record) => {
 					const lexical = finalLexicalScore(tokens, record);
-					return { record, lexical, score: enrichScore(record, lexical, options) };
+					return { record, lexical, score: enrichScore(record, lexical, scoreOptions) };
 				})
 				.filter((result) => tokens.length === 0 || result.lexical > 0)
 				.sort((a, b) => b.score - a.score)
@@ -817,11 +1214,14 @@ export class MemoryStore {
 			const header = this.readDocumentHeader(path);
 			if (!header?.id) continue;
 			if (!options.includeForgotten && header.status === "forgotten") continue;
+			if (!this.isScopeEnabled(header.scope)) continue;
 			if (scopeFilter && header.scope !== scopeFilter) continue;
 			if (typeFilter && header.type !== typeFilter) continue;
+			if (tagFilters.length > 0 && !tagFilters.every((tag) => header.tags?.includes(tag))) continue;
+			if (header.expiresAt && Date.parse(header.expiresAt) < Date.now()) continue;
 			const lexical = baseLexicalScore(tokens, header);
 			if (tokens.length > 0 && lexical === 0) continue;
-			headers.push({ header, lexical, score: enrichScore(header, lexical, options) });
+			headers.push({ header, lexical, score: enrichScore(header, lexical, scoreOptions) });
 		}
 
 		const candidateCount = Math.max(limit, Math.min(headers.length, limit * 4));
@@ -830,9 +1230,10 @@ export class MemoryStore {
 			.map(({ header }) => {
 				const record = this.loadDocumentBody(header.docPath);
 				const lexical = finalLexicalScore(tokens, record);
-				return { record, lexical, score: enrichScore(record, lexical, options) };
+				return { record, lexical, score: enrichScore(record, lexical, scoreOptions) };
 			})
 			.filter((result) => tokens.length === 0 || result.lexical > 0)
+			.filter((result) => tagFilters.length === 0 || tagFilters.every((tag) => result.record.tags?.includes(tag)))
 			.sort((a, b) => b.score - a.score)
 			.slice(0, limit);
 		return full;
@@ -901,10 +1302,12 @@ export function formatForgottenRecords(records, options = {}) {
 export function formatMemoryCapsule(results, options = {}) {
 	const maxItems = options.maxItems ?? 4;
 	const maxChars = options.maxChars ?? 1200;
+	const minScore = options.minScore ?? -Infinity;
 	const lines = [];
-	for (const { record } of results.slice(0, maxItems)) {
+	for (const { record } of results.filter((result) => (result.score ?? 0) >= minScore).slice(0, maxItems)) {
 		const topic = record.topicKey ? `${record.topicKey}: ` : "";
-		const line = `- [${record.type}/${record.scope}] ${topic}${record.title} — ${String(record.content ?? "").replace(/\s+/g, " ")}`;
+		const pin = record.pinned ? "📌 " : "";
+		const line = `- ${pin}[${record.type}/${record.scope}] ${topic}${record.title} — ${String(record.content ?? "").replace(/\s+/g, " ")}`;
 		lines.push(line.length > 260 ? `${line.slice(0, 257)}...` : line);
 	}
 	if (!lines.length) return "";
@@ -919,5 +1322,7 @@ export function memoryRecordForSessionSummary(summary, metadata = {}) {
 		content: summary,
 		scope: metadata.scope || "branch-local",
 		topicKey: metadata.topicKey,
+		source: metadata.source,
+		relevantFiles: metadata.relevantFiles,
 	};
 }

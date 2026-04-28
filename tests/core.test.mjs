@@ -1,15 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { statSync } from "node:fs";
 import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
+	DEFAULT_REMEMBRALL_CONFIG,
 	MemoryStore,
 	formatForgetCandidates,
 	formatForgottenRecords,
 	formatMemoryCapsule,
 	formatTimestamp,
 	formatWorkResume,
+	loadRemembrallConfig,
 	memoryRecordForSessionSummary,
 	parseMemoryDocument,
 	serializeMemoryDocument,
@@ -561,7 +564,10 @@ test("tree detail rendering shows structured metadata and markdown body sections
 				type: "decision",
 				scope: "project",
 				status: "active",
-				content: "# Summary\n## Decision\n- keep markdown details",
+				pinned: true,
+				source: "remember",
+				relevantFiles: ["src/core.mjs"],
+				content: "# Summary\n\n## Decision\n- keep markdown details\n- preserve bullets",
 				revision: 1,
 				createdAt: "2026-04-27T22:43:56-03:00",
 				updatedAt: "2026-04-27T22:43:56-03:00",
@@ -577,7 +583,135 @@ test("tree detail rendering shows structured metadata and markdown body sections
 	browser.handleInput("enter");
 	const rendered = browser.render(120).join("\n");
 	assert.match(rendered, /Status: active/);
+	assert.match(rendered, /Pinned: yes/);
+	assert.match(rendered, /Source: remember/);
+	assert.match(rendered, /Files: src\/core\.mjs/);
 	assert.match(rendered, /Body/);
 	assert.match(rendered, /Summary/);
 	assert.match(rendered, /Decision/);
+	assert.match(rendered, /• keep markdown details/);
+	assert.match(rendered, /• preserve bullets/);
+});
+
+test("config loader provides defaults and env overrides", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-remembrall-config-"));
+	try {
+		const configPath = join(dir, "config.json");
+		await writeFile(configPath, JSON.stringify({ capsule: { maxItems: 9 }, scopes: { enabled: ["project"] } }, null, 2), "utf8");
+		const loaded = loadRemembrallConfig({ dataDir: dir, configPath, env: { PI_REMEMBRALL_CAPSULE_MAX_ITEMS: "3", PI_REMEMBRALL_RECALL_MIN_SCORE: "12" } });
+		assert.equal(loaded.capsule.maxItems, 3);
+		assert.equal(loaded.recall.minScore, 12);
+		assert.deepEqual(loaded.scopes.enabled, ["project"]);
+		assert.equal(DEFAULT_REMEMBRALL_CONFIG.capsule.maxChars, 1200);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("disabled scopes are not saved or recalled", async () => {
+	await withStore(async (_store, dir) => {
+		const store = new MemoryStore({ dataDir: dir, config: { ...DEFAULT_REMEMBRALL_CONFIG, scopes: { enabled: ["project", "branch-local"] } } });
+		await store.init();
+		await assert.rejects(() => store.saveMemory({ title: "Personal secret", type: "preference", content: "Nope", scope: "personal" }), /Scope disabled/);
+	});
+});
+
+test("richer metadata persists in markdown front matter", async () => {
+	await withStore(async (store) => {
+		const saved = await store.saveMemory({
+			title: "Tagged memory",
+			type: "decision",
+			content: "Body",
+			scope: "project",
+			tags: ["ux", "tree"],
+			relations: ["mem_other"],
+			source: "remember",
+			relevantFiles: ["src/tree.mjs"],
+			pinned: true,
+		});
+		const text = await readFile(saved.record.docPath, "utf8");
+		assert.match(text, /tags: \["ux", "tree"\]/);
+		assert.match(text, /relations: \["mem_other"\]/);
+		assert.match(text, /source: "remember"/);
+		assert.match(text, /relevant_files: \["src\/tree\.mjs"\]/);
+		assert.match(text, /pinned: true/);
+	});
+});
+
+test("saveMemory returns duplicate hints for similar memories", async () => {
+	await withStore(async (store) => {
+		await store.saveMemory({ title: "Use markdown docs", type: "decision", content: "Persist memory as markdown documents.", scope: "project" });
+		const saved = await store.saveMemory({ title: "Use markdown document store", type: "decision", content: "Persist memories as markdown docs for tree detail readability.", scope: "project" });
+		assert.ok(Array.isArray(saved.duplicates));
+		assert.ok(saved.duplicates.length >= 1);
+	});
+});
+
+test("prune forgets stale session summaries", async () => {
+	await withStore(async (store) => {
+		const oldSummary = await store.saveMemory(memoryRecordForSessionSummary("old summary", { title: "Old summary" }));
+		store.records.set(oldSummary.record.id, { ...store.records.get(oldSummary.record.id), updatedAt: "2020-01-01T00:00:00+00:00", createdAt: "2020-01-01T00:00:00+00:00" });
+		await store.writeMarkdownDocument(store.records.get(oldSummary.record.id), { path: store.records.get(oldSummary.record.id).docPath });
+		const pruned = await store.pruneMemories({ sessionSummaryDays: 1 });
+		assert.equal(pruned.pruned.length, 1);
+		assert.equal(store.getRecord(oldSummary.record.id), undefined);
+	});
+});
+
+test("recall supports natural filters, tags, and accent normalization", async () => {
+	await withStore(async (store) => {
+		await store.saveMemory({ title: "Decisión de proyecto", type: "decision", content: "Arquitectura con acentos.", scope: "project", tags: ["arquitectura"] });
+		await store.saveMemory({ title: "Preferencia personal", type: "preference", content: "Otra cosa.", scope: "personal", tags: ["preferencia"] });
+		const filtered = store.recall("solo decisiones del proyecto #arquitectura", { limit: 5 });
+		assert.equal(filtered.length, 1);
+		assert.equal(filtered[0].record.type, "decision");
+		const accented = store.recall("arquitectura", { limit: 5 });
+		assert.equal(accented[0].record.title, "Decisión de proyecto");
+	});
+});
+
+test("memory capsule respects minimum score threshold", async () => {
+	await withStore(async (store) => {
+		await store.saveMemory({ title: "Unrelated note", type: "decision", content: "Completely different topic.", scope: "project" });
+		const results = store.recall("different", { limit: 5 });
+		assert.equal(formatMemoryCapsule(results, { minScore: 999 }), "");
+	});
+});
+
+test("snapshot export and import round-trip records and forgotten ids", async () => {
+	await withStore(async (store, dir) => {
+		const saved = await store.saveMemory({ title: "Roundtrip", type: "decision", content: "Export me.", scope: "project" });
+		await store.forgetMemory({ id: saved.record.id, reason: "test" });
+		const snapshot = store.exportSnapshot();
+		const reloaded = new MemoryStore({ dataDir: join(dir, "imported") });
+		await reloaded.init();
+		await reloaded.importSnapshot(snapshot);
+		assert.equal(reloaded.allRecords().length, 0);
+		assert.equal(reloaded.allRecords({ includeForgotten: true }).length, 1);
+	});
+});
+
+test("cache corruption rebuilds from durable markdown documents", async () => {
+	await withStore(async (store, dir) => {
+		await store.saveMemory({ title: "Recover me", type: "decision", content: "From docs.", scope: "project" });
+		await writeFile(join(dir, "cache.v1.json"), "not-json", "utf8");
+		const recovered = new MemoryStore({ dataDir: dir });
+		await recovered.init();
+		assert.equal(recovered.allRecords().length, 1);
+		assert.equal(recovered.allRecords()[0].title, "Recover me");
+	});
+});
+
+test("journal compaction preserves durable memories", async () => {
+	await withStore(async (store, dir) => {
+		await store.saveMemory({ title: "Compact me", type: "decision", content: "Still here.", scope: "project" });
+		const before = statSync(join(dir, "memories.v1.jsonl")).size;
+		await store.compactJournal();
+		const after = statSync(join(dir, "memories.v1.jsonl")).size;
+		assert.ok(after > 0);
+		assert.ok(after <= before + 200);
+		const reloaded = new MemoryStore({ dataDir: dir });
+		await reloaded.init();
+		assert.equal(reloaded.allRecords()[0].title, "Compact me");
+	});
 });

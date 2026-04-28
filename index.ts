@@ -1,4 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { Type } from "typebox";
 import {
@@ -7,11 +9,13 @@ import {
 	MEMORY_TYPES,
 	MemoryStore,
 	branchPathFromEntries,
+	detectRepoContext,
 	formatForgetCandidates,
 	formatForgottenRecords,
 	formatMemoryCapsule,
 	formatRecallResults,
 	memoryRecordForSessionSummary,
+	parseRecallQuery,
 } from "./src/core.mjs";
 import { buildRemembrallTree, renderTreePlainText, RemembrallTreeBrowser } from "./src/tree.mjs";
 
@@ -34,12 +38,18 @@ const RememberParams = Type.Object({
 	content: Type.String({ description: "Structured memory content. Prefer What/Why/Where/Learned when applicable." }),
 	scope: Type.Optional(memoryScopeEnum),
 	topicKey: Type.Optional(Type.String({ description: "Stable topic key for evolving topics, e.g. architecture/memory-index." })),
+	tags: Type.Optional(Type.Array(Type.String())),
+	relations: Type.Optional(Type.Array(Type.String())),
+	source: Type.Optional(Type.String()),
+	relevantFiles: Type.Optional(Type.Array(Type.String())),
+	pinned: Type.Optional(Type.Boolean()),
 });
 
 const RecallParams = Type.Object({
 	query: Type.String({ description: "Search query for saved memories." }),
 	type: Type.Optional(memoryTypeEnum),
 	scope: Type.Optional(memoryScopeEnum),
+	tags: Type.Optional(Type.Array(Type.String())),
 	limit: Type.Optional(Type.Number({ description: "Maximum number of compact results to return." })),
 });
 
@@ -59,10 +69,13 @@ const ForgetParams = Type.Object({
 
 function metadataFromContext(ctx: ExtensionContext) {
 	const branch = ctx.sessionManager.getBranch();
+	const repo = detectRepoContext();
 	return {
 		sessionFile: ctx.sessionManager.getSessionFile(),
 		leafId: ctx.sessionManager.getLeafId(),
 		branchPath: branchPathFromEntries(branch),
+		repoId: repo.repoId,
+		gitBranch: repo.gitBranch,
 	};
 }
 
@@ -233,6 +246,8 @@ async function saveLifecycleSummary(pi: ExtensionAPI, ctx: ExtensionContext, exp
 		memoryRecordForSessionSummary(summary, {
 			title: title || "Work resume",
 			topicKey: undefined,
+			source: checkpointRecord ? "checkpoint" : trigger,
+			relevantFiles: extractFileReferences(summary),
 		}),
 	);
 	savedLifecycleSummary = true;
@@ -245,6 +260,42 @@ async function saveCheckpointResume(pi: ExtensionAPI, ctx: ExtensionContext, che
 	const saved = await saveLifecycleSummary(pi, ctx, resume, `Work resume: ${checkpointRecord.title}`, checkpointRecord, trigger);
 	resumeVersion = Math.max(resumeVersion, activityVersion + 1);
 	return saved;
+}
+
+function parseCommandFields(text: string) {
+	const fields: Record<string, string> = {};
+	const pattern = /(\w+):/g;
+	const matches = [...text.matchAll(pattern)];
+	for (let i = 0; i < matches.length; i += 1) {
+		const key = matches[i][1];
+		const start = matches[i].index! + matches[i][0].length;
+		const end = i + 1 < matches.length ? matches[i + 1].index! : text.length;
+		fields[key] = text.slice(start, end).trim();
+	}
+	return fields;
+}
+
+function formatStatusSummary(summary: any) {
+	const scopes = Object.entries(summary.countsByScope || {}).map(([scope, count]) => `- ${scope}: ${count}`).join("\n");
+	const types = Object.entries(summary.countsByType || {}).map(([type, count]) => `- ${type}: ${count}`).join("\n");
+	return [
+		`Pi Remembrall status`,
+		`Total live memories: ${summary.total}`,
+		`Forgotten memories: ${summary.forgotten}`,
+		"",
+		"Scopes:",
+		scopes,
+		"",
+		"Types:",
+		types,
+		"",
+		`Data dir: ${summary.storage.dataDir}`,
+		`Documents: ${summary.storage.documents}`,
+	].join("\n");
+}
+
+function formatDoctorReport(report: any) {
+	return [formatStatusSummary(report), "", `Issues: ${report.issues.length ? report.issues.join(", ") : "none"}`].join("\n");
 }
 
 export default function (pi: ExtensionAPI) {
@@ -264,11 +315,18 @@ export default function (pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event, ctx) => {
 		await initializeFromSession(ctx);
 		lastPrompt = event.prompt;
+		const meta = metadataFromContext(ctx);
 		const results = store.recall(event.prompt, {
-			branchPath: metadataFromContext(ctx).branchPath,
-			limit: 4,
+			branchPath: meta.branchPath,
+			repoId: meta.repoId,
+			gitBranch: meta.gitBranch,
+			limit: store.config?.recall?.defaultLimit ?? 5,
 		});
-		const capsule = formatMemoryCapsule(results, { maxItems: 4, maxChars: 1200 });
+		const capsule = formatMemoryCapsule(results, {
+			maxItems: store.config?.capsule?.maxItems ?? 4,
+			maxChars: store.config?.capsule?.maxChars ?? 1200,
+			minScore: store.config?.recall?.minScore ?? 1,
+		});
 		if (!capsule) return;
 		return {
 			systemPrompt: `${event.systemPrompt}\n\n${capsule}\n\nUse these memories only when relevant. Do not mention Pi Remembrall unless the user asks about memory.`,
@@ -319,16 +377,19 @@ export default function (pi: ExtensionAPI) {
 		executionMode: "sequential",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			await initializeFromSession(ctx);
-			const saved = await saveMemoryThroughStore(pi, ctx, params);
+			const saved = await saveMemoryThroughStore(pi, ctx, { ...params, source: params.source || "remember" });
 			const resume = saved.record.type === "session_summary" ? undefined : await saveCheckpointResume(pi, ctx, saved.record, "explicit remember checkpoint");
 			const action = saved.updated ? "Updated" : "Saved";
 			const topic = saved.record.topicKey ? ` topic=${saved.record.topicKey}` : "";
+			const duplicatesText = saved.duplicates?.length
+				? `\nPossible duplicates:\n${saved.duplicates.map((item: any) => `- ${item.record.id}: ${item.record.title}`).join("\n")}`
+				: "";
 			const resumeText = resume ? `\nSaved work resume ${resume.record.id}: ${resume.record.title}` : "";
 			return {
 				content: [
 					{
 						type: "text",
-						text: `${action} memory ${saved.record.id}${topic}: ${saved.record.title}${resumeText}`,
+						text: `${action} memory ${saved.record.id}${topic}: ${saved.record.title}${duplicatesText}${resumeText}`,
 					},
 				],
 				details: { ...saved, resume },
@@ -347,15 +408,20 @@ export default function (pi: ExtensionAPI) {
 		parameters: RecallParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			await initializeFromSession(ctx);
-			const results = store.recall(params.query, {
-				type: params.type,
-				scope: params.scope,
-				limit: params.limit ?? 5,
-				branchPath: metadataFromContext(ctx).branchPath,
+			const meta = metadataFromContext(ctx);
+			const parsed = parseRecallQuery(params.query, params);
+			const results = store.recall(parsed.query || params.query, {
+				type: params.type ?? parsed.type,
+				scope: params.scope ?? parsed.scope,
+				tags: params.tags ?? parsed.tags,
+				limit: params.limit ?? store.config?.recall?.defaultLimit ?? 5,
+				branchPath: meta.branchPath,
+				repoId: meta.repoId,
+				gitBranch: meta.gitBranch,
 			});
 			return {
 				content: [{ type: "text", text: formatRecallResults(results) }],
-				details: { count: results.length, results },
+				details: { count: results.length, results, parsed },
 			};
 		},
 	} as any);
@@ -430,10 +496,77 @@ export default function (pi: ExtensionAPI) {
 	} as any);
 
 	pi.registerCommand("remembrall", {
-		description: "Show Pi Remembrall memory status, recall memories, or manage forget candidates",
+		description: "Show Pi Remembrall memory status, recall memories, or manage memory operations",
 		handler: async (args, ctx) => {
 			await initializeFromSession(ctx);
 			const trimmed = args.trim();
+			const meta = metadataFromContext(ctx);
+			if (trimmed === "status" || trimmed === "") {
+				ctx.ui.notify(formatStatusSummary(store.statusSummary()), "info");
+				return;
+			}
+			if (trimmed === "doctor") {
+				ctx.ui.notify(formatDoctorReport(store.doctor()), "info");
+				return;
+			}
+			if (trimmed.startsWith("export")) {
+				const exportPath = trimmed.slice("export".length).trim() || join(store.dataDir, "exports", `remembrall-export-${Date.now()}.json`);
+				await mkdir(join(store.dataDir, "exports"), { recursive: true });
+				await writeFile(exportPath, JSON.stringify(store.exportSnapshot(), null, 2), "utf8");
+				ctx.ui.notify(`Exported memories to ${exportPath}`, "info");
+				return;
+			}
+			if (trimmed.startsWith("import")) {
+				const importPath = trimmed.slice("import".length).trim();
+				if (!importPath) {
+					ctx.ui.notify("Usage: /remembrall import <path>", "info");
+					return;
+				}
+				const raw = await readFile(importPath, "utf8");
+				const result = await store.importSnapshot(raw);
+				ctx.ui.notify(`Imported snapshot with ${result.records} record(s).`, "info");
+				return;
+			}
+			if (trimmed.startsWith("pin")) {
+				const fields = parseCommandFields(trimmed.slice("pin".length).trim());
+				if (!fields.id) {
+					ctx.ui.notify("Usage: /remembrall pin id:<memory-id>", "info");
+					return;
+				}
+				const saved = await store.pinMemory({ id: fields.id, pinned: true });
+				ctx.ui.notify(`Pinned memory ${saved.record.id}: ${saved.record.title}`, "info");
+				return;
+			}
+			if (trimmed.startsWith("revise") || trimmed.startsWith("edit")) {
+				const fields = parseCommandFields(trimmed.replace(/^(revise|edit)\s+/, ""));
+				if (!fields.id) {
+					ctx.ui.notify("Usage: /remembrall revise id:<memory-id> title:<new title> content:<new content>", "info");
+					return;
+				}
+				const saved = await store.reviseMemory({
+					id: fields.id,
+					title: fields.title,
+					content: fields.content,
+					topicKey: fields.topicKey,
+					tags: fields.tags ? fields.tags.split(",").map((tag) => tag.trim()).filter(Boolean) : undefined,
+				}, meta);
+				ctx.ui.notify(`Revised memory ${saved.record.id}: ${saved.record.title}`, "info");
+				return;
+			}
+			if (trimmed.startsWith("explain")) {
+				const fields = parseCommandFields(trimmed.slice("explain".length).trim());
+				const query = fields.query || lastPrompt || "";
+				const explanation = fields.id
+					? store.explainRecall({ query, repoId: meta.repoId, gitBranch: meta.gitBranch, branchPath: meta.branchPath }).find((item: any) => item.record.id === fields.id)
+					: store.explainRecall({ query, repoId: meta.repoId, gitBranch: meta.gitBranch, branchPath: meta.branchPath })[0];
+				ctx.ui.notify(explanation ? `${explanation.record.id}: ${explanation.record.title}\nscore=${explanation.score}\nsignals=${explanation.signals.join(", ")}` : "No explanation available.", "info");
+				return;
+			}
+			if (trimmed.startsWith("prune")) {
+				const pruned = await store.pruneMemories({ metadata: meta });
+				ctx.ui.notify(pruned.pruned.length ? formatForgottenRecords(pruned.pruned, { prefix: "Pruned memories" }) : "No stale memories to prune.", "info");
+				return;
+			}
 			if (trimmed.startsWith("forget")) {
 				const forgetArgs = trimmed.slice("forget".length).trim();
 				if (!forgetArgs) {
@@ -451,7 +584,8 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(formatForgottenRecords(forgotten.records, { prefix }), "info");
 					return;
 				}
-				const results = store.recall(forgetArgs, { branchPath: metadataFromContext(ctx).branchPath, limit: 5 });
+				const parsed = parseRecallQuery(forgetArgs);
+				const results = store.recall(parsed.query || forgetArgs, { branchPath: meta.branchPath, repoId: meta.repoId, gitBranch: meta.gitBranch, limit: store.config?.recall?.defaultLimit ?? 5, scope: parsed.scope, type: parsed.type, tags: parsed.tags });
 				ctx.ui.notify(formatForgetCandidates(results, { query: forgetArgs }), "info");
 				return;
 			}
@@ -460,7 +594,8 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`Pi Remembrall has ${store.allRecords().length} memories.`, "info");
 				return;
 			}
-			const results = store.recall(query, { branchPath: metadataFromContext(ctx).branchPath, limit: 5 });
+			const parsed = parseRecallQuery(query);
+			const results = store.recall(parsed.query || query, { branchPath: meta.branchPath, repoId: meta.repoId, gitBranch: meta.gitBranch, limit: store.config?.recall?.defaultLimit ?? 5, scope: parsed.scope, type: parsed.type, tags: parsed.tags });
 			ctx.ui.notify(formatRecallResults(results), "info");
 		},
 	});

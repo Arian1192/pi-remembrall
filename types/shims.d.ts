@@ -10,3 +10,13 @@ declare module "@mariozechner/pi-ai" {
 declare module "typebox" {
   export const Type: any;
 }
+
+declare module "node:fs/promises" {
+  export const mkdir: any;
+  export const readFile: any;
+  export const writeFile: any;
+}
+
+declare module "node:path" {
+  export const join: any;
+}

@@ -123,7 +123,7 @@ function renderMarkdownDocumentLines(content, theme, width) {
 	for (const rawLine of safeText(content).split("\n")) {
 		const line = rawLine.trimEnd();
 		if (!line.trim()) {
-			lines.push("");
+			if (lines.length > 0 && lines[lines.length - 1] !== "") lines.push("");
 			continue;
 		}
 		const heading = line.match(/^(#{1,6})\s+(.*)$/);
@@ -131,12 +131,24 @@ function renderMarkdownDocumentLines(content, theme, width) {
 			if (lines.length > 0 && lines[lines.length - 1] !== "") lines.push("");
 			const level = heading[1].length;
 			const title = heading[2].trim();
-			const prefix = level === 1 ? "  § " : level === 2 ? "  • " : "    - ";
+			const prefix = level === 1 ? "§ " : level === 2 ? "• " : "- ";
 			for (const wrapped of wrapPlainText(`${prefix}${title}`, Math.max(1, width - 2))) lines.push(`  ${wrapped}`);
+			lines.push("");
+			continue;
+		}
+		const bullet = line.match(/^([*-])\s+(.*)$/);
+		if (bullet) {
+			for (const wrapped of wrapPlainText(`• ${bullet[2].trim()}`, Math.max(1, width - 2))) lines.push(`  ${wrapped}`);
+			continue;
+		}
+		const numbered = line.match(/^(\d+)\.\s+(.*)$/);
+		if (numbered) {
+			for (const wrapped of wrapPlainText(`${numbered[1]}. ${numbered[2].trim()}`, Math.max(1, width - 2))) lines.push(`  ${wrapped}`);
 			continue;
 		}
 		for (const wrapped of wrapPlainText(line, Math.max(1, width - 2))) lines.push(`  ${wrapped}`);
 	}
+	while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
 	return lines;
 }
 
@@ -177,7 +189,10 @@ function renderDetailPane(node, theme, width, bodyRows, detailsScroll = 0, focus
 		metaLines.push(`  Scope: ${theme.fg("accent", record.scope)}`);
 		if (record.topicKey) metaLines.push(`  Topic: ${theme.fg("accent", record.topicKey)}`);
 		if (record.status) metaLines.push(`  Status: ${theme.fg(record.status === "forgotten" ? "warning" : "success", record.status)}`);
+		if (record.pinned) metaLines.push(`  Pinned: ${theme.fg("accent", "yes")}`);
+		if (record.source) metaLines.push(`  Source: ${theme.fg("muted", record.source)}`);
 		if (record.tags?.length) metaLines.push(`  Tags: ${theme.fg("muted", record.tags.join(", "))}`);
+		if (record.relevantFiles?.length) metaLines.push(`  Files: ${theme.fg("muted", record.relevantFiles.join(", "))}`);
 		if (record.revision) metaLines.push(`  Revision: ${theme.fg("accent", String(record.revision))}`);
 		if (record.updatedAt) metaLines.push(`  Updated: ${theme.fg("dim", record.updatedAt)}`);
 		if (record.createdAt) metaLines.push(`  Created: ${theme.fg("dim", record.createdAt)}`);
@@ -429,7 +444,10 @@ export function renderNodeDetails(node, theme, width = 120) {
 		lines.push(truncateToWidth(`  Scope: ${theme.fg("accent", record.scope)}`, width));
 		if (record.topicKey) lines.push(truncateToWidth(`  Topic: ${theme.fg("accent", record.topicKey)}`, width));
 		if (record.status) lines.push(truncateToWidth(`  Status: ${theme.fg(record.status === "forgotten" ? "warning" : "success", record.status)}`, width));
+		if (record.pinned) lines.push(truncateToWidth(`  Pinned: ${theme.fg("accent", "yes")}`, width));
+		if (record.source) lines.push(truncateToWidth(`  Source: ${theme.fg("muted", record.source)}`, width));
 		if (record.tags?.length) lines.push(truncateToWidth(`  Tags: ${theme.fg("muted", record.tags.join(", "))}`, width));
+		if (record.relevantFiles?.length) lines.push(truncateToWidth(`  Files: ${theme.fg("muted", record.relevantFiles.join(", "))}`, width));
 		if (record.revision) lines.push(truncateToWidth(`  Revision: ${theme.fg("accent", String(record.revision))}`, width));
 		if (record.updatedAt) lines.push(truncateToWidth(`  Updated: ${theme.fg("dim", record.updatedAt)}`, width));
 		if (record.createdAt) lines.push(truncateToWidth(`  Created: ${theme.fg("dim", record.createdAt)}`, width));
